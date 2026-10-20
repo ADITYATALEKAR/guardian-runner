@@ -1,0 +1,110 @@
+name: guardian-scan
+
+# PUBLIC runner repo: NO engine code lives here. This job checks out the PRIVATE
+# engine with a read-only deploy key, runs ONE whole-tenant scan headless, encrypts
+# the result to the public key in this repo, uploads only that ciphertext, and wipes
+# the workspace. Decrypt locally with scripts/ci_result_import.py in the engine repo.
+#
+# SAFETY INVARIANTS (do not weaken):
+#   * No pull_request trigger — a fork can never run this or read secrets.
+#   * The scan target is NOT a dispatch input (inputs are visible on a public run
+#     page). It is read from a repo secret named by `target_secret`, formatted
+#     "Institution Name|example.com". GitHub masks the value in logs.
+#   * The engine silences its sensitive loggers; only coarse progress is printed.
+#   * The result artifact is ciphertext only. No plaintext ever leaves the runner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_secret:
+        description: "Name of the repo secret holding 'Institution|domain' (e.g. TARGET_1)"
+        required: true
+        default: "TARGET_1"
+      seconds:
+        description: "Cycle budget seconds"
+        required: false
+        default: "1200"
+      max_endpoints:
+        description: "Observation cap"
+        required: false
+        default: "1000"
+      max_workers:
+        description: "Observation thread workers (engine cap 75)"
+        required: false
+        default: "32"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scan-${{ github.event.inputs.target_secret }}
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ENGINE_DIR: ${{ github.workspace }}/engine
+    steps:
+      - name: Check out runner repo (for the result public key)
+        uses: actions/checkout@v4
+        with:
+          path: runner
+          persist-credentials: false
+
+      - name: Check out PRIVATE engine (read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.ENGINE_REPO }}
+          ref: ${{ vars.ENGINE_REF }}
+          ssh-key: ${{ secrets.ENGINE_DEPLOY_KEY }}
+          path: engine
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: engine/requirements-ci.txt
+
+      - name: Install engine dependencies
+        run: python -m pip install -q --upgrade pip && python -m pip install -q -r "$ENGINE_DIR/requirements-ci.txt"
+
+      - name: Resolve target from secret
+        id: target
+        env:
+          TARGET: ${{ secrets[github.event.inputs.target_secret] }}
+        run: |
+          if [ -z "$TARGET" ]; then echo "secret ${{ github.event.inputs.target_secret }} is empty/missing"; exit 1; fi
+          IFS='|' read -r inst dom <<< "$TARGET"
+          if [ -z "$inst" ] || [ -z "$dom" ]; then echo "target secret must be 'Institution|domain'"; exit 1; fi
+          echo "::add-mask::$inst"; echo "::add-mask::$dom"
+          { echo "inst=$inst"; echo "dom=$dom"; } >> "$GITHUB_OUTPUT"
+
+      - name: Run scan (headless, logs silenced, result encrypted)
+        working-directory: engine
+        env:
+          PYTHONPATH: ${{ env.ENGINE_DIR }}
+          GUARDIAN_SCAN_INSTITUTION: ${{ steps.target.outputs.inst }}
+          GUARDIAN_SCAN_DOMAIN: ${{ steps.target.outputs.dom }}
+          GUARDIAN_SCAN_SECONDS: ${{ github.event.inputs.seconds }}
+          GUARDIAN_SCAN_MAX_ENDPOINTS: ${{ github.event.inputs.max_endpoints }}
+          GUARDIAN_SCAN_MAX_WORKERS: ${{ github.event.inputs.max_workers }}
+          GUARDIAN_SCAN_PUBLIC_KEY: ${{ github.workspace }}/runner/ci_result_public.pem
+          GUARDIAN_SCAN_OUT: ${{ runner.temp }}/scan_result.enc
+          GUARDIAN_SCAN_ROOT: ${{ runner.temp }}/ci_scan_workspace
+        run: python scripts/ci_scan_export.py
+
+      - name: Upload encrypted result (ciphertext only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-result-${{ github.run_id }}
+          path: ${{ runner.temp }}/scan_result.enc
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Wipe workspace (always)
+        if: always()
+        run: rm -rf "${{ runner.temp }}/ci_scan_workspace" "${{ runner.temp }}/scan_result.enc" "$ENGINE_DIR" || true

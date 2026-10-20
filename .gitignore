@@ -1,0 +1,9 @@
+# Never commit engine code or scan data into this public repo.
+engine/
+*.json
+scan_result*
+.ci_scan_workspace/
+ci_scan_workspace/
+__pycache__/
+*.pyc
+.env

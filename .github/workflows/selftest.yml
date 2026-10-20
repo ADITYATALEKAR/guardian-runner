@@ -1,0 +1,111 @@
+name: guardian-selftest
+
+# End-to-end pipeline test on real GitHub infrastructure WITHOUT touching any third
+# party: a local HTTPS server on :443 serves a page seeded with chatbot / internal-
+# exposure signals; the engine (STRICT TLS, trusting a throwaway CA installed on the
+# runner) scans `localhost`, and we assert that observation ran, endpoints were saved,
+# the ai_chatbot + internal_exposure probes fired, and the exported artifact is
+# ciphertext. Runs on every push to this repo and on demand.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      ENGINE_DIR: ${{ github.workspace }}/engine
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: runner
+          persist-credentials: false
+
+      - name: Check out PRIVATE engine (read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.ENGINE_REPO }}
+          ref: ${{ vars.ENGINE_REF }}
+          ssh-key: ${{ secrets.ENGINE_DEPLOY_KEY }}
+          path: engine
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: engine/requirements-ci.txt
+
+      - name: Install engine dependencies
+        run: python -m pip install -q --upgrade pip && python -m pip install -q -r "$ENGINE_DIR/requirements-ci.txt"
+
+      - name: Start seeded HTTPS selftest server on :443 and trust its CA
+        run: |
+          # Belt and braces: systemd-resolved synthesizes *.localhost -> loopback, but pin
+          # the two seeds in /etc/hosts so the test never depends on resolver behaviour.
+          echo "127.0.0.1 selftest.localhost www.selftest.localhost" | sudo tee -a /etc/hosts >/dev/null
+          sudo "$(which python)" "$ENGINE_DIR/scripts/ci_selftest_server.py" --bind 127.0.0.1 --ca-out "$RUNNER_TEMP/selftest-ca.crt" > "$RUNNER_TEMP/selftest-server.log" 2>&1 &
+          for i in $(seq 1 30); do
+            [ -f "$RUNNER_TEMP/selftest-ca.crt" ] && curl -s --cacert "$RUNNER_TEMP/selftest-ca.crt" https://localhost/ -o /dev/null && break
+            sleep 1
+          done
+          curl -s --cacert "$RUNNER_TEMP/selftest-ca.crt" https://localhost/ | head -c 120; echo
+          sudo cp "$RUNNER_TEMP/selftest-ca.crt" /usr/local/share/ca-certificates/guardian-selftest.crt
+          sudo update-ca-certificates | tail -1
+
+      - name: Scan localhost (strict TLS via system trust store)
+        working-directory: engine
+        env:
+          PYTHONPATH: ${{ env.ENGINE_DIR }}
+          SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+          REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+          GUARDIAN_SCAN_INSTITUTION: Selftest Bank
+          GUARDIAN_SCAN_DOMAIN: selftest.localhost
+          GUARDIAN_SCAN_SECONDS: "240"
+          GUARDIAN_SCAN_MAX_ENDPOINTS: "50"
+          GUARDIAN_SCAN_MAX_WORKERS: "16"
+          GUARDIAN_SCAN_PUBLIC_KEY: ${{ github.workspace }}/runner/ci_result_public.pem
+          GUARDIAN_SCAN_OUT: ${{ runner.temp }}/selftest.enc
+          GUARDIAN_SCAN_ROOT: ${{ runner.temp }}/selftest_workspace
+        run: python scripts/ci_scan_export.py --print-summary --summary-out "$RUNNER_TEMP/summary.json"
+
+      - name: Assert pipeline behaviour
+        run: |
+          python - "$RUNNER_TEMP/summary.json" "$RUNNER_TEMP/selftest.enc" <<'PY'
+          import json, sys
+          s = json.load(open(sys.argv[1]))
+          print("summary:", json.dumps(s))
+          errs = []
+          if s.get("endpoint_count", 0) < 1: errs.append("observation produced 0 endpoints (budget starvation?)")
+          pids = set(s.get("probe_ids") or [])
+          if "ai_chatbot" not in pids: errs.append("ai_chatbot probe did not fire on seeded page")
+          if "internal_exposure" not in pids: errs.append("internal_exposure probe did not fire on seeded page")
+          blob = open(sys.argv[2], "rb").read()
+          if not blob.startswith(b"GDNRES1\n"): errs.append("artifact is not Guardian ciphertext")
+          if b"Selftest Bank" in blob or b"localhost" in blob: errs.append("artifact contains plaintext")
+          print("artifact bytes:", len(blob))
+          if errs:
+              print("FAILED:\n - " + "\n - ".join(errs)); sys.exit(1)
+          print("ALL CHECKS PASSED")
+          PY
+
+      - name: Upload encrypted selftest result (proves the artifact path)
+        uses: actions/upload-artifact@v4
+        with:
+          name: selftest-result-${{ github.run_id }}
+          path: ${{ runner.temp }}/selftest.enc
+          retention-days: 1
+
+      - name: Server log (on failure)
+        if: failure()
+        run: tail -20 "$RUNNER_TEMP/selftest-server.log" || true
+
+      - name: Wipe workspace (always)
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/selftest_workspace" "$RUNNER_TEMP/selftest.enc" "$ENGINE_DIR" || true
