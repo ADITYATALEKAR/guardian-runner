@@ -86,6 +86,7 @@ jobs:
           pids = set(s.get("probe_ids") or [])
           if "ai_chatbot" not in pids: errs.append("ai_chatbot probe did not fire on seeded page")
           if "internal_exposure" not in pids: errs.append("internal_exposure probe did not fire on seeded page")
+          if s.get("export_errors"): errs.append("export aspects failed: " + ", ".join(s["export_errors"]))
           blob = open(sys.argv[2], "rb").read()
           if not blob.startswith(b"GDNRES1\n"): errs.append("artifact is not Guardian ciphertext")
           if b"Selftest Bank" in blob or b"localhost" in blob: errs.append("artifact contains plaintext")
